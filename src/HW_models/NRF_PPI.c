@@ -232,6 +232,7 @@ static const ppi_event_table_t ppi_events_table[] = { //better keep same order a
     //    {TIMER2_EVENTS_COMPARE_4, &NRF_TIMER_regs[2].EVENTS_COMPARE[4]},
     //    {TIMER2_EVENTS_COMPARE_5, &NRF_TIMER_regs[2].EVENTS_COMPARE[5]},
 
+    {RTC0_EVENTS_OVRFLW, &NRF_RTC_regs[0].EVENTS_OVRFLW},
     //{RTC0_EVENTS_COMPARE_0, &NRF_RTC_regs[0].EVENTS_COMPARE[0]},
     {RTC0_EVENTS_COMPARE_1, &NRF_RTC_regs[0].EVENTS_COMPARE[1]},
     {RTC0_EVENTS_COMPARE_2, &NRF_RTC_regs[0].EVENTS_COMPARE[2]},

@@ -39,6 +39,10 @@
 #define N_CC 4
 
 #define RTC_COUNTER_MASK 0xFFFFFF /*24 bits*/
+
+#define SUB_US_BITS 9 // Bits representing sub-microsecond units
+#define SUB_US_FRAC_MASK ((1 << SUB_US_BITS) - 1) // Mask used to extract the fraction part of time in sub-microsecond units (0x1FF)
+
 NRF_RTC_Type NRF_RTC_regs[N_RTC];
 
 static bool RTC_Running[N_RTC] = {false};
@@ -46,6 +50,7 @@ static uint32_t RTC_INTEN[N_RTC] = {0};
 
 bs_time_t Timer_RTC = TIME_NEVER;
 static bs_time_t cc_timers[N_RTC][N_CC] = {{TIME_NEVER}}; //when each CC will match (in microseconds)
+static bs_time_t overflow_timer[N_RTC] = {TIME_NEVER}; //when the timer will overflow (in microseconds)
 
 static bs_time_t RTC_counter_startT[N_RTC] = {TIME_NEVER}; //Time when the counter was "started" (really the time that would correspond to COUNTER = 0)
 static uint32_t counter[N_RTC] = {0}; //Internal counter value when the counter was stopped
@@ -62,6 +67,7 @@ void nrf_rtc_init() {
     for (int j  = 0 ; j < N_CC ; j++) {
       cc_timers[i][j] = TIME_NEVER;
     }
+    overflow_timer[i] = TIME_NEVER;
   }
   Timer_RTC = TIME_NEVER;
 }
@@ -75,17 +81,33 @@ void nrf_rtc_notify_first_lf_tick() {
   bs_trace_raw_time(9, "RTC: First lf tick\n");
 }
 
+/**
+ * Convert a time delta in sub-microseconds units to the equivalent time in microseconds
+ */
+static bs_time_t sub_us_time_to_us_time(bs_time_t sub_us_time)
+{
+  return sub_us_time >> SUB_US_BITS;
+}
+
+/**
+ * Convert a time delta in microseconds to the equivalent time in sub-microseconds units
+ * (crop if the time in microseconds is not an integer)
+ */
+static bs_time_t us_time_to_sub_us_time(bs_time_t us_time)
+{
+  return us_time << SUB_US_BITS;
+}
 
 static bs_time_t get_last_lf_tick_time() {
   bs_time_t now = tm_get_hw_time();
 
-  if (now > TIME_NEVER>>9) {
+  if (now > sub_us_time_to_us_time(TIME_NEVER)) {
     bs_trace_error_time_line("Bummer, the RTC model only supports running for 1142 years\n");
     /*If you really need this, generalize the calculation to more than 64 bits*/
   }
 
-  uint64_t lf_ticks = ((now - first_lf_tick_time)<<9) / LF_CLOCK_PERIOD; //floor()
-  bs_time_t last_tick_time = lf_ticks * LF_CLOCK_PERIOD >> 9;
+  uint64_t lf_ticks = us_time_to_sub_us_time(now - first_lf_tick_time) / LF_CLOCK_PERIOD; //floor()
+  bs_time_t last_tick_time = sub_us_time_to_us_time(lf_ticks * LF_CLOCK_PERIOD);
   last_tick_time += first_lf_tick_time;
 
   return last_tick_time;
@@ -99,30 +121,63 @@ static uint64_t time_to_counter(bs_time_t delta, int rtc) {
   uint64_t ticks;
   //Note: we add 1us, to account for the RTC ticks happening in the floor of the us
   // as 1us is way smaller than the LF_CLOCK_PERIOD it will not cause an issue rounding the counter value up
-  ticks = ((delta + 1)<< 9) / ((uint64_t)LF_CLOCK_PERIOD * (NRF_RTC_regs[rtc].PRESCALER + 1));
+  ticks = us_time_to_sub_us_time(delta + 1) / ((uint64_t)LF_CLOCK_PERIOD * (NRF_RTC_regs[rtc].PRESCALER + 1));
   return ticks;
 }
 
 /**
  * Convert a counter delta to microseconds accounting for the PRESCALER
- * (the fractional number microseconds with 9 bit resolution, is stored in frac)
+ * (the fractional number microseconds with 9 (SUB_US_BITS) bit resolution, is stored in frac)
  */
 static bs_time_t counter_to_time(uint64_t counter, int rtc, uint16_t *frac) {
   bs_time_t Elapsed;
   Elapsed = counter  * (uint64_t)LF_CLOCK_PERIOD * (NRF_RTC_regs[rtc].PRESCALER + 1);
   if (frac != NULL){
-    *frac = Elapsed & 0x1FF;
+    *frac = Elapsed & SUB_US_FRAC_MASK;
   }
-  return Elapsed >> 9;
+  return sub_us_time_to_us_time(Elapsed);
 }
 
 /**
  * Return the time it takes for the COUNTER to do 1 wrap
  *  The whole number of microseconds is stored in us, the fractional number of microseconds
- *  with 9 bits resolution is stored in frac
+ *  with 9 (SUB_US_BITS) bits resolution is stored in frac
  */
 static void time_of_1_counter_wrap(int rtc, bs_time_t *us, uint16_t *frac) {
   *us = counter_to_time((uint64_t)RTC_COUNTER_MASK + 1, rtc, frac);
+}
+
+static bs_time_t get_counter_match_time(uint64_t counter_match, int rtc)
+{
+  bs_time_t next_match_us = TIME_NEVER;
+
+  if (RTC_Running[rtc] == true) {
+    uint16_t next_match_frac;
+    bs_time_t now = tm_get_hw_time();
+
+    next_match_us = RTC_counter_startT[rtc]
+                              + counter_to_time(counter_match, rtc, &next_match_frac);
+
+    if (next_match_us <= now) {
+      bs_time_t t_us;
+      uint16_t t_frac;
+
+      time_of_1_counter_wrap(rtc, &t_us, &t_frac);
+
+
+      do {
+        next_match_us += t_us;
+        next_match_frac += t_frac;
+        if (next_match_frac >= us_time_to_sub_us_time(1U)){
+          next_match_frac -= us_time_to_sub_us_time(1U);
+          next_match_us +=1;
+        }
+      } while (next_match_us <= now);
+
+    }
+  }
+
+  return next_match_us;
 }
 
 static void update_master_timer() {
@@ -136,6 +191,10 @@ static void update_master_timer() {
         Timer_RTC = cc_timers[rtc][cc];
       }
     }
+
+    if (overflow_timer[rtc] < Timer_RTC) {
+      Timer_RTC = overflow_timer[rtc];
+    }
   }
   nrf_hw_find_next_timer_to_trigger();
 }
@@ -145,39 +204,17 @@ static void update_master_timer() {
  * CC[cc] register
  */
 static void update_cc_timer(int rtc, int cc) {
-  if (RTC_Running[rtc] == true) {
-    uint16_t next_match_frac;
-    bs_time_t next_match_us = RTC_counter_startT[rtc]
-                              + counter_to_time(NRF_RTC_regs[rtc].CC[cc], rtc, &next_match_frac);
-
-    bs_time_t now = tm_get_hw_time();
-
-    if (next_match_us <= now) {
-      bs_time_t t_us;
-      uint16_t t_frac;
-
-      time_of_1_counter_wrap(rtc, &t_us, &t_frac);
-
-      do {
-        next_match_us += t_us;
-        next_match_frac += t_frac;
-        if (next_match_frac >= 0x200){
-          next_match_frac -= 0x200;
-          next_match_us +=1;
-        }
-      } while (next_match_us <= now);
-
-    }
-    cc_timers[rtc][cc] = next_match_us;
-  } else {
-    cc_timers[rtc][cc] = TIME_NEVER;
-  }
+  cc_timers[rtc][cc] = get_counter_match_time(NRF_RTC_regs[rtc].CC[cc], rtc);
 }
 
 static void update_all_cc_timers(int rtc) {
   for (int cc = 0 ; cc < N_CC; cc++){
     update_cc_timer(rtc, cc);
   }
+}
+
+static void update_overflow_timer(int rtc) {
+  overflow_timer[rtc] = get_counter_match_time(RTC_COUNTER_MASK + 1, rtc);
 }
 
 static unsigned int get_irq_t(int rtc)
@@ -200,7 +237,7 @@ static unsigned int get_irq_t(int rtc)
     return irq_t;
 }
 
-static ppi_event_types_t get_event(int rtc)
+static ppi_event_types_t get_cc_event(int rtc)
 {
     ppi_event_types_t event = RTC0_EVENTS_COMPARE_0;
     switch (rtc){
@@ -217,35 +254,83 @@ static ppi_event_types_t get_event(int rtc)
 
     return event;
 }
+static ppi_event_types_t get_overflow_event(int rtc)
+{
+    ppi_event_types_t event = RTC0_EVENTS_OVRFLW;
+    switch (rtc){
+    case 0:
+      event = RTC0_EVENTS_OVRFLW;
+      break;
+    case 1:
+      event = RTC1_EVENTS_OVRFLW;
+      break;
+    case 2:
+      event = RTC2_EVENTS_OVRFLW;
+      break;
+    }
+
+    return event;
+}
+
+static void handle_event(int rtc, ppi_event_types_t event, uint32_t mask)
+{
+  NRF_RTC_Type *RTC_regs = &NRF_RTC_regs[rtc];
+
+  if ( ( RTC_regs->EVTEN | RTC_INTEN[rtc] ) & mask ) {
+    if ( RTC_regs->EVTEN & mask ){
+      nrf_ppi_event(event);
+    }
+    if ( RTC_INTEN[rtc] & mask ){
+      hw_irq_ctrl_set_irq(get_irq_t(rtc));
+    }
+  }
+}
+
+static void handle_cc_event(int rtc, int cc)
+{
+  ppi_event_types_t event = get_cc_event(rtc) + cc;
+  uint32_t mask = RTC_EVTEN_COMPARE0_Msk << cc;
+  NRF_RTC_Type *RTC_regs = &NRF_RTC_regs[rtc];
+
+  if ( cc_timers[rtc][cc] == Timer_RTC ){ //This CC is matching now
+    update_cc_timer(rtc, cc); //Next time it will match
+
+    bs_trace_raw_time(8, "RTC%i: CC%i matching now\n", rtc, cc);
+
+    RTC_regs->EVENTS_COMPARE[cc] = 1;
+    handle_event(rtc, event, mask);
+  }
+}
+
+static void handle_overflow_event(int rtc)
+{
+  ppi_event_types_t event = get_overflow_event(rtc);
+  NRF_RTC_Type *RTC_regs = &NRF_RTC_regs[rtc];
+
+  if ( overflow_timer[rtc] ==  Timer_RTC ) //Overflow occured now
+  {
+    update_overflow_timer(rtc); //Next time it will overflow
+
+    bs_trace_raw_time(8, "RTC%i: Timer overflow\n", rtc);
+
+    RTC_regs->EVENTS_OVRFLW = 1;
+    handle_event(rtc, event, RTC_EVTEN_OVRFLW_Msk);
+  }
+}
+
 
 void nrf_rtc_timer_triggered() {
   for ( int rtc = 0; rtc < N_RTC-1/*the 3rd rtc does not have an int*/ ; rtc++ ){
     if ( RTC_Running[rtc] == false ) {
       continue;
     }
-    ppi_event_types_t event = get_event(rtc);
 
-    NRF_RTC_Type *RTC_regs = &NRF_RTC_regs[rtc];
+    for ( int cc = 0 ; cc < N_CC ; cc++) {
+      handle_cc_event(rtc, cc);
+    }
 
-    uint32_t mask = RTC_EVTEN_COMPARE0_Msk;
+    handle_overflow_event(rtc);
 
-    for ( int cc = 0 ; cc < N_CC ; cc++, event++, mask <<=1) {
-      if ( cc_timers[rtc][cc] == Timer_RTC ){ //This CC is matching now
-        update_cc_timer(rtc, cc); //Next time it will match
-
-        bs_trace_raw_time(8, "RTC%i: CC%i matching now\n", rtc, cc);
-
-        if ( ( RTC_regs->EVTEN | RTC_INTEN[rtc] ) & mask ) {
-          RTC_regs->EVENTS_COMPARE[cc] = 1;
-          if ( RTC_regs->EVTEN & mask ){
-            nrf_ppi_event(event);
-          }
-          if ( RTC_INTEN[rtc] & mask ){
-            hw_irq_ctrl_set_irq(get_irq_t(rtc));
-          }
-        }
-      } //if cc_timers[rtc][cc] == Timer_RTC
-    } //for cc
   } //for rtc
   update_master_timer();
 }
@@ -256,9 +341,6 @@ void nrf_rtc_timer_triggered() {
 static void check_not_supported_func(uint32_t i) {
   if (i &  RTC_EVTEN_TICK_Msk) {
     bs_trace_warning_line_time("RTC: The TICK functionality is not modelled\n");
-  }
-  if (i &  RTC_EVTEN_OVRFLW_Msk) {
-    bs_trace_warning_line_time("RTC: The OVERFLOW functionality is not modelled\n");
   }
 }
 
@@ -285,6 +367,7 @@ void nrf_rtc_TASKS_START(int rtc) {
   RTC_counter_startT[rtc] = get_last_lf_tick_time()
                             - counter_to_time(counter[rtc], rtc, NULL); //If the counter is not zero at start, is like if the counter was started earlier
   update_all_cc_timers(rtc);
+  update_overflow_timer(rtc);
   update_master_timer();
 }
 
@@ -302,6 +385,7 @@ void nrf_rtc_TASKS_STOP(int rtc) {
   for (int cc = 0 ; cc < N_CC ; cc++){
     cc_timers[rtc][cc] = TIME_NEVER;
   }
+  overflow_timer[rtc] = TIME_NEVER;
   update_master_timer();
 }
 
@@ -314,6 +398,7 @@ void nrf_rtc_TASKS_CLEAR(int rtc) {
   counter[rtc] = 0;
   RTC_counter_startT[rtc] = get_last_lf_tick_time();
   update_all_cc_timers(rtc);
+  update_overflow_timer(rtc);
   update_master_timer();
 }
 
